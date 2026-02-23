@@ -1,0 +1,680 @@
+---
+title: "Spatial Autocorrelation Analysis: Moran's I"
+author: "Eric Delmelle"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    code-fold: show
+    code-tools: true
+    theme: cosmo
+    embed-resources: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+---
+
+# Introduction
+
+Spatial autocorrelation measures the degree to which observations at nearby locations are similar to each other. In disease mapping, we use two complementary measures:
+
+1. **Global Moran's I**: Overall spatial autocorrelation across the entire study area
+2. **Local Moran's I (LISA)**: Identifies specific clusters and spatial outliers
+
+---
+
+# Setup and Data Preparation
+
+## Required Packages
+
+```{r setup}
+# Set CRAN mirror
+options(repos = c(CRAN = "https://cloud.r-project.org/"))
+
+# Package installation function
+install_if_needed <- function(packages) {
+  for(pkg in packages) {
+    if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+      install.packages(pkg)
+      library(pkg, character.only = TRUE)
+    }
+  }
+}
+
+# Load required packages
+required_packages <- c(
+  "sf",           # Modern spatial data handling
+  "spdep",        # Spatial dependence analysis
+  "tmap",         # Thematic mapping
+  "RColorBrewer", # Color palettes
+  "dplyr",        # Data manipulation
+  "ggplot2",      # Advanced plotting
+  "knitr"         # Document formatting
+)
+
+install_if_needed(required_packages)
+```
+
+## Load and Prepare Data
+
+We'll use the North Carolina SIDS dataset and calculate crude mortality rates.
+
+```{r load_data}
+# Load the NC SIDS dataset
+nc_sids <- st_read(system.file("shape/nc.shp", package = "sf"), quiet = TRUE)
+
+# Prepare the data with crude rates
+nc_sf <- nc_sids %>%
+  mutate(
+    pop = as.numeric(BIR74),         # Births 1974-1978 (population at risk)
+    count = as.numeric(SID74),       # SIDS deaths 1974-1978
+    crude_rate = (count / pop) * 1000  # Rate per 1,000 births
+  ) %>%
+  filter(!is.na(pop) & !is.na(count) & pop > 0)
+
+# Basic summary
+cat("Number of counties:", nrow(nc_sf), "\n")
+cat("Mean crude rate:", round(mean(nc_sf$crude_rate), 3), "per 1,000 births\n")
+cat("SD of crude rate:", round(sd(nc_sf$crude_rate), 3), "\n")
+```
+
+## Visualize Crude Rates
+
+```{r map_crude_rates}
+#| fig-width: 8
+#| fig-height: 6
+
+tm_shape(nc_sf) +
+  tm_fill("crude_rate", 
+          style = "quantile",
+          n = 6,
+          palette = "YlOrRd",
+          title = "Deaths per\n1,000 births") +
+  tm_borders(col = "grey30", lwd = 0.5) +
+  tm_layout(
+    main.title = "Crude SIDS Mortality Rates, North Carolina (1974-1978)",
+    main.title.size = 1.1,
+    legend.outside = TRUE,
+    legend.outside.position = "right",
+    frame = FALSE
+  )
+```
+
+---
+
+# Spatial Weights Matrix
+
+Before calculating spatial autocorrelation, we must define **who is a neighbor**. This is formalized through a **spatial weights matrix**.
+
+## Neighborhood Definitions
+
+Common approaches to defining neighbors:
+
+1. **Queen Contiguity**: Areas sharing any boundary or vertex (like the queen's move in chess)
+2. **Rook Contiguity**: Areas sharing a boundary (like the rook's move in chess)
+3. **K-Nearest Neighbors**: The K closest areas by centroid distance
+4. **Distance Band**: All areas within a specified distance threshold
+
+```{r create_neighbors}
+# Convert to Spatial object for spdep compatibility
+nc_sp <- as(nc_sf, "Spatial")
+
+# Calculate county centroids
+coords <- st_coordinates(st_centroid(nc_sf))
+
+# Create different neighbor structures
+nb_queen <- poly2nb(nc_sp, queen = TRUE)
+nb_rook <- poly2nb(nc_sp, queen = FALSE)
+nb_k4 <- knn2nb(knearneigh(coords, k = 4))
+nb_k8 <- knn2nb(knearneigh(coords, k = 8))
+
+# Summary
+cat("Neighborhood Structure Comparison:\n\n")
+cat("Queen Contiguity:\n")
+cat("  Mean neighbors:", round(mean(card(nb_queen)), 2), "\n")
+cat("  Min neighbors:", min(card(nb_queen)), "\n")
+cat("  Max neighbors:", max(card(nb_queen)), "\n\n")
+
+cat("Rook Contiguity:\n")
+cat("  Mean neighbors:", round(mean(card(nb_rook)), 2), "\n")
+cat("  Min neighbors:", min(card(nb_rook)), "\n")
+cat("  Max neighbors:", max(card(nb_rook)), "\n\n")
+
+cat("K=4 Nearest Neighbors:\n")
+cat("  Mean neighbors:", mean(card(nb_k4)), "\n\n")
+
+cat("K=8 Nearest Neighbors:\n")
+cat("  Mean neighbors:", mean(card(nb_k8)), "\n")
+```
+
+## Visualize Neighborhood Connections
+
+```{r visualize_neighbors}
+#| fig-width: 12
+#| fig-height: 5
+
+par(mfrow = c(1, 2), mar = c(1, 1, 3, 1))
+
+# Queen contiguity
+plot(st_geometry(nc_sf), border = "lightgrey", main = "Queen Contiguity Neighbors")
+plot(nb_queen, coords, add = TRUE, col = "red", lwd = 0.5, points = FALSE)
+
+# K=8 nearest neighbors
+plot(st_geometry(nc_sf), border = "lightgrey", main = "K=8 Nearest Neighbors")
+plot(nb_k8, coords, add = TRUE, col = "blue", lwd = 0.5, points = FALSE)
+
+par(mfrow = c(1, 1))
+```
+
+## Row-Standardized Weights
+
+For Moran's I calculation, we convert the neighbor list to a **row-standardized spatial weights matrix** where each neighbor receives equal weight and weights sum to 1 for each area.
+
+```{r create_weights}
+# Create row-standardized weights matrix
+listw_queen <- nb2listw(nb_queen, style = "W", zero.policy = TRUE)
+
+cat("Spatial weights matrix created:\n")
+cat("Style: W (row-standardized)\n")
+cat("Number of regions:", length(listw_queen$neighbours), "\n")
+cat("Total number of links:", sum(card(nb_queen)), "\n")
+```
+
+---
+
+# Global Moran's I
+
+## Theoretical Foundation
+
+**Global Moran's I** measures the overall spatial autocorrelation in a dataset. It is analogous to a Pearson correlation coefficient but for spatial data.
+
+### The Formula
+
+$$I = \frac{n}{\sum_i \sum_j w_{ij}} \cdot \frac{\sum_i \sum_j w_{ij}(x_i - \bar{x})(x_j - \bar{x})}{\sum_i (x_i - \bar{x})^2}$$
+
+Where:
+
+- $n$ = number of spatial units
+- $x_i$ = value at location $i$ (e.g., crude rate)
+- $\bar{x}$ = mean value across all locations
+- $w_{ij}$ = spatial weight between locations $i$ and $j$
+
+**Simplified interpretation**: Moran's I measures whether similar values (both high or both low) tend to be located near each other.
+
+### Interpretation of Moran's I
+
+- **I > 0**: Positive spatial autocorrelation (similar values cluster)
+- **I ≈ 0**: No spatial autocorrelation (random spatial pattern)
+- **I < 0**: Negative spatial autocorrelation (dissimilar values cluster - rare in practice)
+
+**Range**: Typically between -1 and +1, though exact bounds depend on the spatial weights structure.
+
+### Expected Value Under Null Hypothesis
+
+If there is **no spatial autocorrelation** (complete spatial randomness), the expected value is:
+
+$$E[I] = \frac{-1}{n-1}$$
+
+For our data with 100 counties: $E[I] = -0.0101$
+
+### Statistical Significance
+
+We test the null hypothesis: **"There is no spatial autocorrelation"**
+
+Two approaches:
+
+1. **Permutation test**: Randomly permute the values across locations many times and compare observed I to the distribution of permuted I values
+2. **Analytical approach**: Assume normality and use theoretical variance
+
+## Implementation
+
+```{r global_morans}
+# Calculate Global Moran's I
+moran_test <- moran.test(nc_sf$crude_rate, listw_queen)
+
+# Display results
+cat("Global Moran's I Test Results\n")
+cat("==============================\n\n")
+cat("Moran's I statistic:", round(moran_test$estimate[1], 4), "\n")
+cat("Expected value (random):", round(moran_test$estimate[2], 4), "\n")
+cat("Variance:", round(moran_test$estimate[3], 6), "\n\n")
+cat("Z-score:", round(moran_test$statistic, 4), "\n")
+cat("P-value:", format.pval(moran_test$p.value, digits = 4), "\n\n")
+
+if (moran_test$p.value < 0.001) {
+  cat("Interpretation: Highly significant positive spatial autocorrelation\n")
+} else if (moran_test$p.value < 0.05) {
+  cat("Interpretation: Significant positive spatial autocorrelation\n")
+} else {
+  cat("Interpretation: No significant spatial autocorrelation\n")
+}
+## Moran Scatterplot
+
+```{r moran_scatterplot}
+#| fig-width: 8
+#| fig-height: 6
+
+# Calculate spatially lagged values
+nc_sf$lag_rate <- lag.listw(listw_queen, nc_sf$crude_rate)
+
+# Standardize variables for plotting
+nc_sf$std_rate <- scale(nc_sf$crude_rate)
+nc_sf$std_lag <- scale(nc_sf$lag_rate)
+
+# Create Moran scatterplot
+ggplot(nc_sf, aes(x = std_rate, y = std_lag)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(alpha = 0.6, size = 3, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  annotate("text", x = 1.5, y = 1.5, label = "HH\n(High-High)", 
+           color = "red", fontface = "bold", size = 4) +
+  annotate("text", x = -1.5, y = 1.5, label = "LH\n(Low-High)", 
+           color = "blue", fontface = "bold", size = 4) +
+  annotate("text", x = 1.5, y = -1.5, label = "HL\n(High-Low)", 
+           color = "blue", fontface = "bold", size = 4) +
+  annotate("text", x = -1.5, y = -1.5, label = "LL\n(Low-Low)", 
+           color = "red", fontface = "bold", size = 4) +
+  labs(
+    title = "Moran Scatterplot: Crude SIDS Mortality Rates",
+    subtitle = paste0("Global Moran's I = ", 
+                     round(moran_test$estimate[1], 3),
+                     ", p-value = ", 
+                     format.pval(moran_test$p.value, digits = 3)),
+    x = "Standardized Crude Rate",
+    y = "Spatially Lagged Standardized Rate\n(Average of Neighbors)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+```
+
+**Quadrant interpretation**:
+
+- **HH (High-High)**: High rates with high-rate neighbors
+- **LL (Low-Low)**: Low rates with low-rate neighbors
+- **HL (High-Low)**: High rates with low-rate neighbors
+- **LH (Low-High)**: Low rates with high-rate neighbors
+
+---
+
+# Local Moran's I (LISA)
+
+## Theoretical Foundation
+
+**Local Indicators of Spatial Association (LISA)** decompose global spatial autocorrelation into local contributions, identifying specific locations that contribute most to the overall pattern.
+
+### The Formula
+
+For each location $i$:
+
+$$I_i = \frac{x_i - \bar{x}}{m_2} \sum_j w_{ij}(x_j - \bar{x})$$
+
+Where:
+
+- $I_i$ = Local Moran's I at location $i$
+- $x_i$ = value at location $i$
+- $\bar{x}$ = global mean
+- $m_2 = \frac{\sum_i (x_i - \bar{x})^2}{n}$ (variance)
+- $w_{ij}$ = spatial weight between $i$ and $j$
+
+**Key property**: $\sum_i I_i \propto I$ (sum of local statistics proportional to global statistic)
+
+### Interpretation
+
+Each $I_i$ measures the extent of significant spatial clustering of similar (positive) or dissimilar (negative) values around location $i$.
+
+### Statistical Significance
+
+For each location, we test: **"Is the local spatial pattern significantly different from random?"**
+
+This is done via conditional permutation:
+
+1. Hold location $i$ fixed
+2. Randomly permute values at all other locations
+3. Recalculate $I_i$ for each permutation
+4. Compare observed $I_i$ to permutation distribution
+
+### Cluster Types
+
+Based on the sign of $I_i$ and the quadrant in the Moran scatterplot:
+
+- **HH (High-High)**: Hot spots - high values surrounded by high values
+- **LL (Low-Low)**: Cold spots - low values surrounded by low values
+- **HL (High-Low)**: Spatial outliers - high values surrounded by low values
+- **LH (Low-High)**: Spatial outliers - low values surrounded by high values
+
+## Implementation
+
+```{r local_morans}
+# Calculate Local Moran's I
+set.seed(12345)
+local_moran <- localmoran(nc_sf$crude_rate, listw_queen)
+
+# Add results to spatial data
+nc_sf <- nc_sf %>%
+  mutate(
+    local_I = local_moran[, "Ii"],
+    local_I_pvalue = local_moran[, "Pr(z != E(Ii))"],
+    local_I_zscore = local_moran[, "Z.Ii"]
+  )
+
+# Summary of local statistics
+cat("Local Moran's I Summary\n")
+cat("=======================\n\n")
+cat("Number of counties:", nrow(nc_sf), "\n")
+cat("Mean Local I:", round(mean(nc_sf$local_I), 4), "\n")
+cat("SD Local I:", round(sd(nc_sf$local_I), 4), "\n\n")
+
+# Significant clusters (p < 0.05)
+sig_count <- sum(nc_sf$local_I_pvalue < 0.05)
+cat("Significant clusters/outliers (p < 0.05):", sig_count, 
+    paste0("(", round(sig_count/nrow(nc_sf)*100, 1), "%)"), "\n")
+
+# Highly significant (p < 0.01)
+highly_sig <- sum(nc_sf$local_I_pvalue < 0.01)
+cat("Highly significant (p < 0.01):", highly_sig,
+    paste0("(", round(highly_sig/nrow(nc_sf)*100, 1), "%)"), "\n")
+```
+
+## Classify Cluster Types
+
+```{r classify_clusters}
+# Classify each location into cluster type
+nc_sf <- nc_sf %>%
+  mutate(
+    # Standardize for quadrant classification
+    std_rate_local = scale(crude_rate)[,1],
+    std_lag_local = scale(lag_rate)[,1],
+    
+    # Determine quadrant
+    quadrant = case_when(
+      std_rate_local > 0 & std_lag_local > 0 ~ "HH",
+      std_rate_local < 0 & std_lag_local < 0 ~ "LL",
+      std_rate_local > 0 & std_lag_local < 0 ~ "HL",
+      std_rate_local < 0 & std_lag_local > 0 ~ "LH",
+      TRUE ~ "Not Significant"
+    ),
+    
+    # Create cluster type variable (only for significant at p < 0.05)
+    cluster_type = ifelse(local_I_pvalue < 0.05, quadrant, "Not Significant"),
+    
+    # More stringent: p < 0.01
+    cluster_type_strict = ifelse(local_I_pvalue < 0.01, quadrant, "Not Significant")
+  )
+
+# Tabulate cluster types
+cat("\nCluster Type Classification (p < 0.05):\n")
+table(nc_sf$cluster_type)
+
+cat("\nCluster Type Classification (p < 0.01):\n")
+table(nc_sf$cluster_type_strict)
+```
+
+## Map Local Moran's I Values
+
+```{r map_local_I}
+#| fig-width: 8
+#| fig-height: 6
+
+# Map of Local Moran's I values
+tm_shape(nc_sf) +
+  tm_fill("local_I", 
+          style = "quantile",
+          n = 6,
+          palette = "-RdBu",  # Diverging palette
+          title = "Local\nMoran's I") +
+  tm_borders(col = "grey30", lwd = 0.5) +
+  tm_layout(
+    main.title = "Local Moran's I Values",
+    main.title.size = 1.1,
+    legend.outside = TRUE,
+    legend.outside.position = "right",
+    frame = FALSE
+  )
+```
+
+## Map Statistical Significance
+
+```{r map_significance}
+#| fig-width: 8
+#| fig-height: 6
+
+# Map of p-values
+tm_shape(nc_sf) +
+  tm_fill("local_I_pvalue", 
+          style = "fixed",
+          breaks = c(0, 0.01, 0.05, 0.1, 1),
+          palette = "YlOrRd",
+          labels = c("< 0.01", "0.01-0.05", "0.05-0.10", "> 0.10"),
+          title = "P-value") +
+  tm_borders(col = "grey30", lwd = 0.5) +
+  tm_layout(
+    main.title = "Statistical Significance of Local Moran's I",
+    main.title.size = 1.1,
+    legend.outside = TRUE,
+    legend.outside.position = "right",
+    frame = FALSE
+  )
+```
+
+## LISA Cluster Map
+
+The most informative visualization shows **both** cluster type **and** statistical significance:
+
+```{r lisa_map}
+#| fig-width: 8
+#| fig-height: 6
+
+# Define colors for cluster types
+lisa_colors <- c(
+  "HH" = "#d7191c",           # Red for hot spots
+  "LL" = "#2c7bb6",           # Blue for cold spots
+  "HL" = "#fdae61",           # Orange for high outliers
+  "LH" = "#abd9e9",           # Light blue for low outliers
+  "Not Significant" = "grey90"
+)
+
+# Create LISA map (p < 0.05)
+tm_shape(nc_sf) +
+  tm_fill("cluster_type",
+          palette = lisa_colors,
+          title = "Cluster Type\n(p < 0.05)") +
+  tm_borders(col = "grey30", lwd = 0.5) +
+  tm_layout(
+    main.title = "LISA Cluster Map: SIDS Mortality Rates",
+    main.title.size = 1.1,
+    main.title.position = c("center", "top"),
+    legend.outside = TRUE,
+    legend.outside.position = "right",
+    frame = FALSE
+  ) +
+  tm_add_legend(
+    type = "fill",
+    labels = c("Hot Spot (HH)", "Cold Spot (LL)", 
+               "High Outlier (HL)", "Low Outlier (LH)", 
+               "Not Significant"),
+    col = lisa_colors,
+    title = "Interpretation"
+  )
+```
+
+## More Conservative LISA Map (p < 0.01)
+
+```{r lisa_map_strict}
+#| fig-width: 8
+#| fig-height: 6
+
+# Create LISA map with stricter significance threshold
+tm_shape(nc_sf) +
+  tm_fill("cluster_type_strict",
+          palette = lisa_colors,
+          title = "Cluster Type\n(p < 0.01)") +
+  tm_borders(col = "grey30", lwd = 0.5) +
+  tm_layout(
+    main.title = "LISA Cluster Map: SIDS Mortality Rates (Stricter Threshold)",
+    main.title.size = 1.0,
+    legend.outside = TRUE,
+    legend.outside.position = "right",
+    frame = FALSE
+  )
+```
+
+## Side-by-Side Comparison
+
+Compare the crude rates with the LISA clusters to see how local spatial autocorrelation relates to the underlying rate pattern:
+
+```{r comparison_maps}
+#| fig-width: 12
+#| fig-height: 5
+
+# Crude rate map
+map1 <- tm_shape(nc_sf) +
+  tm_fill("crude_rate",
+          style = "quantile",
+          n = 6,
+          palette = "YlOrRd",
+          title = "Deaths per\n1,000 births") +
+  tm_borders(col = "grey30", lwd = 0.3) +
+  tm_layout(
+    main.title = "Crude Rates",
+    main.title.size = 0.9,
+    legend.outside = FALSE,
+    legend.position = c("left", "bottom"),
+    frame = FALSE
+  )
+
+# LISA cluster map
+map2 <- tm_shape(nc_sf) +
+  tm_fill("cluster_type",
+          palette = lisa_colors,
+          title = "Cluster Type") +
+  tm_borders(col = "grey30", lwd = 0.3) +
+  tm_layout(
+    main.title = "LISA Clusters (p < 0.05)",
+    main.title.size = 0.9,
+    legend.outside = FALSE,
+    legend.position = c("left", "bottom"),
+    frame = FALSE
+  )
+
+tmap_arrange(map1, map2, ncol = 2)
+```
+
+## Identify Specific Clusters
+
+Let's identify and describe the significant clusters:
+
+```{r identify_clusters}
+# High-High clusters (hot spots)
+hh_clusters <- nc_sf %>%
+  filter(cluster_type == "HH") %>%
+  st_drop_geometry() %>%
+  arrange(desc(crude_rate)) %>%
+  select(NAME, crude_rate, local_I, local_I_pvalue)
+
+cat("HIGH-HIGH CLUSTERS (Hot Spots):\n")
+cat("===============================\n")
+if (nrow(hh_clusters) > 0) {
+  print(kable(hh_clusters, digits = 3,
+              col.names = c("County", "Crude Rate", "Local I", "P-value")))
+} else {
+  cat("No significant HH clusters detected.\n")
+}
+
+cat("\n")
+
+# Low-Low clusters (cold spots)
+ll_clusters <- nc_sf %>%
+  filter(cluster_type == "LL") %>%
+  st_drop_geometry() %>%
+  arrange(crude_rate) %>%
+  select(NAME, crude_rate, local_I, local_I_pvalue)
+
+cat("LOW-LOW CLUSTERS (Cold Spots):\n")
+cat("==============================\n")
+if (nrow(ll_clusters) > 0) {
+  print(kable(ll_clusters, digits = 3,
+              col.names = c("County", "Crude Rate", "Local I", "P-value")))
+} else {
+  cat("No significant LL clusters detected.\n")
+}
+
+cat("\n")
+
+# High-Low outliers
+hl_outliers <- nc_sf %>%
+  filter(cluster_type == "HL") %>%
+  st_drop_geometry() %>%
+  arrange(desc(crude_rate)) %>%
+  select(NAME, crude_rate, local_I, local_I_pvalue)
+
+cat("HIGH-LOW OUTLIERS:\n")
+cat("==================\n")
+if (nrow(hl_outliers) > 0) {
+  print(kable(hl_outliers, digits = 3,
+              col.names = c("County", "Crude Rate", "Local I", "P-value")))
+} else {
+  cat("No significant HL outliers detected.\n")
+}
+
+cat("\n")
+
+# Low-High outliers
+lh_outliers <- nc_sf %>%
+  filter(cluster_type == "LH") %>%
+  st_drop_geometry() %>%
+  arrange(crude_rate) %>%
+  select(NAME, crude_rate, local_I, local_I_pvalue)
+
+cat("LOW-HIGH OUTLIERS:\n")
+cat("==================\n")
+if (nrow(lh_outliers) > 0) {
+  print(kable(lh_outliers, digits = 3,
+              col.names = c("County", "Crude Rate", "Local I", "P-value")))
+} else {
+  cat("No significant LH outliers detected.\n")
+}
+```
+
+## Distribution of Local I by Cluster Type
+
+```{r distribution_by_type}
+#| fig-width: 10
+#| fig-height: 6
+
+# Box plot of Local I by cluster type
+ggplot(nc_sf, aes(x = cluster_type, y = local_I, fill = cluster_type)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_fill_manual(values = lisa_colors) +
+  labs(
+    title = "Distribution of Local Moran's I by Cluster Type",
+    x = "Cluster Type",
+    y = "Local Moran's I"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+---
+
+# References
+
+Key references for Moran's I and LISA:
+
+- Anselin, L. (1995). Local indicators of spatial association—LISA. *Geographical Analysis*, 27(2), 93-115.
+- Moran, P. A. (1950). Notes on continuous stochastic phenomena. *Biometrika*, 37(1/2), 17-23.
+- Cliff, A. D., & Ord, J. K. (1981). *Spatial processes: models & applications*. Pion.
+- Getis, A., & Ord, J. K. (1992). The analysis of spatial association by use of distance statistics. *Geographical Analysis*, 24(3), 189-206.
+
+R package documentation:
+
+- Bivand, R. S., & Wong, D. W. (2018). Comparing implementations of global and local indicators of spatial association. *TEST*, 27(3), 716-748.
+- `spdep` package: https://r-spatial.github.io/spdep/
+
+---
+
+*Document created with R version `r getRversion()` and `spdep` version `r packageVersion("spdep")`*
